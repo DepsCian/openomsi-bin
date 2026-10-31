@@ -167,7 +167,7 @@ jobs:
           cp PKGBUILD .SRCINFO LICENSE /tmp/aur-repo/
           cd /tmp/aur-repo
           git config user.name "DepsCian"
-          git config user.email "DepsCian@users.noreply.github.com"
+          git config user.email "deps2ak@gmail.com"
           git add PKGBUILD .SRCINFO LICENSE
           git commit -m "Update to v${VERSION}" || {
             echo "Nothing to commit - AUR already at this state"
