@@ -29,7 +29,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Detect upstream version
         id: detect
@@ -50,7 +50,11 @@ jobs:
         id: aur
         run: |
           AUR_VER=$(curl -sf "https://aur.archlinux.org/rpc/v5/info/openomsi-bin" \
-            | jq -r '.results[0].Version // empty' | cut -d- -f1)
+            | jq -r '.results[0].Version // empty' | cut -d- -f1) || true
+          if [ -z "$AUR_VER" ]; then
+            AUR_VER=$(curl -sf "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=openomsi-bin" \
+              | sed -n 's/^pkgver=//p' | head -1) || true
+          fi
           echo "AUR version: ${AUR_VER:-none}"
           echo "aur_version=${AUR_VER:-none}" >> "$GITHUB_OUTPUT"
 
