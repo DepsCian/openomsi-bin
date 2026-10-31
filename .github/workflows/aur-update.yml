@@ -1,0 +1,183 @@
+name: Update AUR Package
+
+on:
+  schedule:
+    - cron: '0 */12 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Target version (e.g. 0.3.45). Empty = latest upstream.'
+        required: false
+        default: ''
+      force:
+        description: 'Force push even if version matches AUR'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: aur-push
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect upstream version
+        id: detect
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          INPUT_VER="${{ inputs.version }}"
+          if [ -n "$INPUT_VER" ]; then
+            VERSION="$INPUT_VER"
+          else
+            TAG=$(gh api repos/openOMSI-org/openOMSI/releases/latest --jq '.tag_name')
+            VERSION="${TAG#v}"
+          fi
+          echo "Detected version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check AUR current version
+        id: aur
+        run: |
+          AUR_VER=$(curl -sf "https://aur.archlinux.org/rpc/v5/info/openomsi-bin" \
+            | jq -r '.results[0].Version // empty' | cut -d- -f1)
+          echo "AUR version: ${AUR_VER:-none}"
+          echo "aur_version=${AUR_VER:-none}" >> "$GITHUB_OUTPUT"
+
+      - name: Decide if update needed
+        id: should_update
+        run: |
+          FORCE="${{ inputs.force }}"
+          UPSTREAM="${{ steps.detect.outputs.version }}"
+          AUR="${{ steps.aur.outputs.aur_version }}"
+          if [ "$FORCE" = "true" ]; then
+            echo "Force push requested"
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          elif [ "$UPSTREAM" = "$AUR" ]; then
+            echo "AUR already at $UPSTREAM - skipping"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Update needed: $AUR -> $UPSTREAM"
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch SHA256 digests from release API
+        id: checksums
+        if: steps.should_update.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.detect.outputs.version }}"
+          TAG="v$VERSION"
+          RESP=$(gh api "repos/openOMSI-org/openOMSI/releases/tags/$TAG")
+
+          X86_DIGEST=$(echo "$RESP" | jq -r \
+            --arg n "openOMSI-${VERSION}-linux-x64.zip" \
+            '.assets[] | select(.name == $n) | .digest // empty' | sed 's/^sha256://')
+          AARCH64_DIGEST=$(echo "$RESP" | jq -r \
+            --arg n "openOMSI-${VERSION}-linux-arm64.zip" \
+            '.assets[] | select(.name == $n) | .digest // empty' | sed 's/^sha256://')
+
+          if [ -z "$X86_DIGEST" ] || [ -z "$AARCH64_DIGEST" ]; then
+            echo "Asset digests unavailable, falling back to SHA256SUMS"
+            SUMS_URL=$(echo "$RESP" | jq -r \
+              '.assets[] | select(.name == "SHA256SUMS") | .browser_download_url')
+            curl -sfL "$SUMS_URL" -o /tmp/SHA256SUMS
+            X86_DIGEST=$(awk -v n="openOMSI-${VERSION}-linux-x64.zip" '$2 == n {print $1}' /tmp/SHA256SUMS)
+            AARCH64_DIGEST=$(awk -v n="openOMSI-${VERSION}-linux-arm64.zip" '$2 == n {print $1}' /tmp/SHA256SUMS)
+          fi
+
+          if [ -z "$X86_DIGEST" ]; then
+            echo "::error::No x86_64 checksum found in release $TAG"
+            exit 1
+          fi
+          if [ -z "$AARCH64_DIGEST" ]; then
+            echo "::error::No aarch64 checksum found in release $TAG"
+            exit 1
+          fi
+
+          LICENSE_SHA=$(sha256sum LICENSE | awk '{print $1}')
+
+          echo "x86_64=$X86_DIGEST"
+          echo "aarch64=$AARCH64_DIGEST"
+          echo "license=$LICENSE_SHA"
+
+          echo "sha256_x86_64=$X86_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "sha256_aarch64=$AARCH64_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "sha256_license=$LICENSE_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Generate PKGBUILD
+        if: steps.should_update.outputs.needed == 'true'
+        run: |
+          sed \
+            -e "s/@VERSION@/${{ steps.detect.outputs.version }}/g" \
+            -e "s/@SHA256_X86_64@/${{ steps.checksums.outputs.sha256_x86_64 }}/g" \
+            -e "s/@SHA256_AARCH64@/${{ steps.checksums.outputs.sha256_aarch64 }}/g" \
+            -e "s/@SHA256_LICENSE@/${{ steps.checksums.outputs.sha256_license }}/g" \
+            PKGBUILD.tmpl > PKGBUILD
+          echo "=== Generated PKGBUILD ==="
+          cat PKGBUILD
+
+      - name: Generate .SRCINFO
+        if: steps.should_update.outputs.needed == 'true'
+        run: |
+          chmod 777 .
+          docker run --rm -v "$PWD:/work" -w /work --user 1000:1000 \
+            archlinux:latest \
+            sh -c "makepkg --printsrcinfo" > .SRCINFO
+          echo "=== Generated .SRCINFO ==="
+          cat .SRCINFO
+
+      - name: Setup SSH for AUR
+        if: steps.should_update.outputs.needed == 'true'
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/aur_key
+          chmod 600 ~/.ssh/aur_key
+          cat > ~/.ssh/config << 'EOF'
+          Host aur.archlinux.org
+              IdentityFile ~/.ssh/aur_key
+              IdentitiesOnly yes
+              StrictHostKeyChecking yes
+              UserKnownHostsFile ~/.ssh/known_hosts
+          EOF
+          cat > ~/.ssh/known_hosts << 'EOF'
+          aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN
+          EOF
+
+      - name: Push to AUR
+        if: steps.should_update.outputs.needed == 'true'
+        run: |
+          VERSION="${{ steps.detect.outputs.version }}"
+          git clone "ssh://aur@aur.archlinux.org/openomsi-bin.git" /tmp/aur-repo
+          cp PKGBUILD .SRCINFO LICENSE /tmp/aur-repo/
+          cd /tmp/aur-repo
+          git config user.name "DepsCian"
+          git config user.email "DepsCian@users.noreply.github.com"
+          git add PKGBUILD .SRCINFO LICENSE
+          git commit -m "Update to v${VERSION}" || {
+            echo "Nothing to commit - AUR already at this state"
+            exit 0
+          }
+          git push origin master
+          echo "Pushed v${VERSION} to AUR"
+
+      - name: Create issue on failure
+        if: failure() && steps.should_update.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "AUR update failed for v${{ steps.detect.outputs.version }}" \
+            --body "The automated AUR push failed. Check the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details." \
+            --label "update-failed" || true
